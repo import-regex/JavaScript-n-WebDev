@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Local Banned Words Test</title>
+</head>
+<body>
+    <h1>DISCORD:</h1>
+    <!-- This div will act as the "textbox" similar to Discord's -->
+    <div role="textbox" aria-multiline="true" spellcheck="true" aria-haspopup="listbox" aria-invalid="false" aria-autocomplete="list" class="markup_f8f345 editor_a552a6 slateTextArea_e52116 fontSize16Padding_bdf0de" autocorrect="off" data-can-focus="true" aria-label="Message @MEE6" data-slate-editor="true" data-slate-node="value" contenteditable="true" zindex="-1" style="border: 1px solid #ccc; width: 600px; height: 150px; padding: 10px;position: relative; outline: none; white-space: pre-wrap; overflow-wrap: break-word;"><div data-slate-node="element"><span data-slate-node="text"><span data-slate-leaf="true" class="emptyText_d4df8b"><span data-slate-zero-width="n" data-slate-length="0">﻿<br></span></span></span></div></div>
+
+    <script>
+        document.getElementById("textInput").addEventListener("keydown", function(event) {
+            if (event.key === "Enter" && !event.shiftKey) {
+                // Prevent newline on Enter key, mimic Discord's submit behavior
+                event.preventDefault();
+                
+                // Trigger any actions that Tampermonkey might be listening for
+                console.log("Enter pressed in text box. Triggering Tampermonkey listeners.");
+            }
+        });
+    </script>
+</body>
+</html>
+
+
