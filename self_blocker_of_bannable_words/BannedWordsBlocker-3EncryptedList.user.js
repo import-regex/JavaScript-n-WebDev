@@ -21,9 +21,10 @@
  //                                                                                     Beware it might cause major slowdown, especially for large messages
  window.listbannedwords = `Your banned words are: ${bannedWordsR} You can hardcode any custom array of strings to the bannedWordsR array as plain text`;
  const bannedWordsRegex = new RegExp(`\\b((${bannedWordsR.join('|')})[sed]{0,3}?){1,3}?\\b`, 'ig');
-
+ let bypass=0
  const onEnterKey = (event, textbox) => {
-  if (event.key === 'Enter' && !event.shiftKey) {
+  if (!bypass && event.key === 'Enter' && !event.shiftKey) {
+
    const parser = document.createElement('div');
    parser.innerHTML = textbox.innerHTML;
 
@@ -35,13 +36,12 @@
     .join('\n');
 
    const match = textContent.match(bannedWordsRegex);
+
    if (match) {
     event.stopImmediatePropagation();
     event.preventDefault();
-    // Confirmation dialog with instructions
-    if (confirm(`Your message contains "${match}". Press Cancel(ESC) to continue editing, or CLICK on OK to send anyways!`)) {
-     textbox.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-    }
+    bypass = !confirm(`Your message contains "${match}". OK/Esc=continue editing. Cancel=1 free pass!`)
+    //       ^Inverse logic to move the change the default action to holding the messasge. Bypassing requires switching the focus, confirming the choice and manually doing the send action again.
    }
   }
  };
@@ -52,6 +52,7 @@
    const handleKeydown = (event) => onEnterKey(event, textbox);
    textbox.removeEventListener('keydown', handleKeydown, true);
    textbox.addEventListener('keydown', handleKeydown, true);
+   bypass=0
   }
  });
 
