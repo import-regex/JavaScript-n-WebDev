@@ -1,0 +1,628 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rolling clip buffer</title>
+<style>
+  * { box-sizing: border-box; }
+  :root {
+    color-scheme: light;
+    --bg: #eeeeef;
+    --surface: #ffffff;
+    --text: #202124;
+    --muted: #5f6368;
+    --border: #c8cacc;
+    --input: #ffffff;
+    --preview: #d4d6d8;
+    --accent: #356ac3;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --bg: #202124;
+      --surface: #292b2f;
+      --text: #e8eaed;
+      --muted: #aeb4bc;
+      --border: #484c52;
+      --input: #34373c;
+      --preview: #17191c;
+      --accent: #8ab4f8;
+    }
+  }
+  body {
+    font: 14px system-ui, sans-serif;
+    margin: 1rem;
+    background: var(--bg);
+    color: var(--text);
+  }
+  main {
+    min-height: calc(100vh - 2rem);
+	display: flex;
+	flex-direction: column;
+	gap: 1rem;
+  }
+  header {
+    display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: .6rem;
+    padding: .75rem; background: var(--surface);  
+  }
+  header label {
+    display: flex;
+    align-items: center;
+    gap: .3rem;
+  }
+  input[type=number], button {
+    color: var(--text);
+	background: var(--input);
+    border: 2px solid var(--border);
+    padding: .175rem .2rem;
+  }
+  input[type=number]  {
+    width: 4rem;
+  }
+  button { cursor: pointer; }
+  button:disabled { cursor: default; opacity: .55 }
+  #status { white-space: pre-wrap; color: var(--muted); flex: 1 1 100%; }
+  #clips {
+    display: flex;
+    flex-wrap: wrap;
+	justify-content: flex-start;
+	gap: .5rem; padding: .5rem 0
+  }
+  .clip { flex: 0 0 8rem; width: 8rem; display: grid; align-content: start; gap: .25rem; }
+  .clip canvas {
+    display: block; width: 8rem; height: 4.5rem;
+    background: var(--preview); border: 1px solid var(--border);
+    cursor: pointer;
+  }
+  .clip canvas:hover { outline: 2px solid var(--accent); }
+  .clip label {
+    display: flex;
+	align-items: center;
+	gap: .3rem; color: var(--muted)
+  }
+  footer {
+    margin-top: auto;
+	display: flex;
+	justify-content: space-between;
+	gap: .5rem;
+	flex-wrap: wrap;
+	color: var(--muted)
+  }
+  #start.visible { display: inline-block; }
+</style>
+
+<main>
+  <header>
+    <button id="start">Start capture</button>
+    <button id="pause" disabled>STOP capture</button>
+    <button id="download" disabled>Download selected clips</button>
+    <label>Clips <input id="clip_count" type="number" min="1" value="10"></label>
+    <label>Duration (s) <input id="clip_duration" type="number" min="1" max="3600" value="15"></label>
+    <label>Bitrate (Mbps) <input id="bitrate" type="number" min="0.5" max="100" step="0.5" value="8"></label>
+    <label>FPS <input id="fps" type="number" min="5" max="360" value="30"></label>
+    <label>Resolution
+      <input id="width" type="number" min="160" max="7680" step="1" value="1920" aria-label="Capture width">
+      ×
+      <input id="height" type="number" min="90" max="4320" step="1" value="1080" aria-label="Capture height">
+    </label>
+    <span id="status">Requesting window capture…</span>
+  </header>
+
+  <section id="clips" aria-label="Clip buffer"></section>
+
+  <footer>
+    <span>Oldest ← → Newest</span>
+	<span> Note: the output file is larger than it can be. Run it trough ffmpeg or any video editor to shrink 20-50% of size at no quality cost</span>
+  </footer>
+  Info: https://github.com/import-regex/
+</main>
+
+<script src="./mediabunny.cjs"></script>
+<script>
+const {
+  Input,
+  ALL_FORMATS,
+  BlobSource,
+  EncodedPacketSink,
+  EncodedVideoPacketSource,
+  EncodedAudioPacketSource,
+  Output,
+  WebMOutputFormat,
+  BufferTarget
+} = Mediabunny;
+
+(() => {
+  'use strict';
+
+  const $ = id => document.getElementById(id);
+  const clipsEl = $('clips');
+  const statusEl = $('status');
+  const startButton = $('start');
+  const pauseButton = $('pause');
+  const downloadButton = $('download');
+  const countInput = $('clip_count');
+  const durationInput = $('clip_duration');
+  const bitrateInput = $('bitrate');
+  const fpsInput = $('fps');
+  const widthInput = $('width');
+  const heightInput = $('height');
+
+  const MIME = [
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm'
+  ].find(type => MediaRecorder.isTypeSupported(type)) || '';
+
+  let buffer = [];
+  let slots = [];
+  let stream, recorder, timer, liveVideo, clipCount, clipDuration, bitrate, frameRate, width, height;
+  let paused = true;
+  let stopping = false;
+  let parts = [];
+  let generation = 0;
+
+  function status(text) {
+    statusEl.textContent = text;
+  }
+
+  function makeSlot() {
+    const item = document.createElement('div');
+    item.className = 'clip';
+
+    const canvas = document.createElement('canvas');
+    canvas.width = 160;
+    canvas.height = 90;
+
+    const label = document.createElement('label');
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = true;
+    checkbox.hidden = true;
+    const time = document.createElement('span');
+    label.append(checkbox, time);
+
+    item.append(canvas, label);
+    clipsEl.append(item);
+
+    const slot = {
+      item,
+      canvas,
+      ctx: canvas.getContext('2d', { alpha: false }),
+      checkbox,
+      time,
+      clip: null,
+      frame: null
+    };
+
+    checkbox.addEventListener('change', () => {
+      if (slot.clip) slot.clip.selected = checkbox.checked;
+      updateDownload();
+    });
+
+    canvas.addEventListener('click', () => {
+      if (!slot.clip) return;
+      checkbox.checked = !checkbox.checked;
+      checkbox.dispatchEvent(new Event('change'));
+    });
+
+    return slot;
+  }
+
+  function resizeBuffer() {
+
+    // Keep the newest clips when shrinking the buffer.
+    if (buffer.length > clipCount) buffer = buffer.slice(-clipCount); //left-slice the buffer so that count -1 clips are retained
+    while (slots.length < clipCount) slots.push(makeSlot());
+    while (slots.length > clipCount) {
+      const slot = slots.pop();
+      slot.item.remove();
+    }
+
+    render();
+  }
+
+  function render() {
+    slots.forEach((slot, i) => {
+      const clip = buffer[i];
+      slot.clip = clip;
+      slot.item.hidden = !clip;
+
+      if (!clip) {
+        slot.frame = null;
+        slot.ctx.clearRect(0, 0, 160, 90);
+        slot.checkbox.hidden = true;
+        slot.time.textContent = '';
+        return;
+      }
+
+      slot.ctx.clearRect(0, 0, 160, 90);
+      if (slot.frame) slot.ctx.drawImage(slot.frame, 0, 0, 160, 90);
+      slot.checkbox.checked = clip.selected;
+      slot.checkbox.hidden = !paused;
+    });
+
+    updateDownload();
+  }
+
+  function updateDownload() {
+    downloadButton.disabled =
+      !paused || !buffer.some(clip => clip.selected);
+  }
+
+  function snapshot() {
+    const canvas = document.createElement('canvas');
+    canvas.width = 160;
+    canvas.height = 90;
+
+    if (liveVideo?.readyState >= 2) {
+	  canvas.getContext('2d', { alpha: false })
+	  .drawImage(liveVideo, 0, 0, 160, 90);
+    }
+
+    return canvas;
+  }
+
+  function addClip(blob) {
+    buffer[buffer.length - 1].blob = blob;
+    render();
+  }
+
+  async function beginSegment() {
+    if (paused || !stream || !liveVideo ||
+        stream.getVideoTracks().every(t => t.readyState !== 'live')) return;
+
+    // Wait until a real captured frame is available for this segment's thumbnail.
+    if (liveVideo.readyState < 2) {
+      await new Promise(resolve => {
+        liveVideo.addEventListener('loadeddata', resolve, { once: true });
+      });
+    }
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    if (paused) return;
+
+    parts = [];
+    if (buffer.length >= clipCount) {
+      buffer.shift();
+      slots.forEach((slot, i) => {
+        slot.frame = slots[i + 1]?.frame || null;
+      });
+    }
+    buffer.push({ blob: null, selected: true });
+    const slot = slots[buffer.length - 1];
+    slot.frame = snapshot();
+    slot.ctx.clearRect(0, 0, 160, 90);
+    slot.ctx.drawImage(slot.frame, 0, 0, 160, 90);
+    slot.clip = buffer[buffer.length - 1];
+    slot.checkbox.checked = true;
+
+    try {
+      const recorderOptions = { videoBitsPerSecond: bitrate * 1_000_000 };
+      if (MIME) recorderOptions.mimeType = MIME;
+      recorder = new MediaRecorder(stream, recorderOptions);
+    } catch (error) {
+      status('Cannot create recorder: ' + error.message);
+      return;
+    }
+
+    const currentRecorder = recorder;
+
+    currentRecorder.ondataavailable = event => {
+      if (event.data?.size) parts.push(event.data);
+    };
+
+    currentRecorder.onerror = event => {
+      status('Recording error: ' + (event.error?.message || 'unknown error'));
+    };
+
+    currentRecorder.onstop = () => {
+      if (stopping) {
+        stopping = false;
+        parts = [];
+        return;
+      }
+
+      if (parts.length) {
+        addClip(new Blob(parts, { type: currentRecorder.mimeType || 'video/webm' }));
+      }
+      parts = [];
+
+      if (!paused && stream) beginSegment();
+    };
+
+    currentRecorder.start();
+
+    timer = setInterval(() => {
+      clearInterval(timer);
+      timer = null;
+      if (currentRecorder.state === 'recording') currentRecorder.stop();
+    }, clipDuration);
+  }
+
+  function stopCurrentSegment(discard = true) {
+    clearInterval(timer);
+    timer = null;
+    if (!recorder || recorder.state !== 'recording') return Promise.resolve();
+
+    const currentRecorder = recorder;
+    stopping = discard;
+    return new Promise(resolve => {
+      currentRecorder.addEventListener('stop', resolve, { once: true });
+      currentRecorder.stop();
+    });
+  }
+
+  function readSettings() {
+    const clamp = (input, fallback) => {
+      const min = Number(input.min || 0);
+      const max = Number(input.max || Infinity);
+      const value = Number(input.value);
+      const next = Math.max(min, Math.min(max, Number.isFinite(value) && value ? value : fallback));
+      input.value = next;
+      return next;
+    };
+
+    clipCount = Math.round(clamp(countInput, 10));
+    clipDuration = clamp(durationInput, 15) * 1000;
+    bitrate = clamp(bitrateInput, 8);
+    frameRate = clamp(fpsInput, 30);
+    width = clamp(widthInput, 1920);
+    height = clamp(heightInput, 1080);
+  }
+
+  async function startCapture() {
+    readSettings();
+    startButton.disabled = true;
+
+    try {
+      if (!stream) {
+        stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+        liveVideo = document.createElement('video');
+        liveVideo.muted = true;
+        liveVideo.playsInline = true;
+        liveVideo.srcObject = stream;
+        await liveVideo.play();
+
+        stream.getVideoTracks()[0].addEventListener('ended', async () => {
+          paused = true;
+          await stopCurrentSegment(true);
+          pauseButton.disabled = true;
+          startButton.disabled = false;
+          status('Capture ended. Buffered clips remain available.');
+          render();
+        }, { once: true });
+      } else {
+        // Applying settings starts a fresh recording session and discards the old buffer.
+        paused = true;
+        await stopCurrentSegment(true);
+      }
+
+      const videoTrack = stream.getVideoTracks()[0];
+      if (videoTrack?.applyConstraints) {
+        try {
+          await videoTrack.applyConstraints({
+            width: { ideal: width },
+            height: { ideal: height },
+            frameRate: { ideal: frameRate }
+          });
+        } catch (error) {
+          status('Capture settings partly unavailable: ' + error.message);
+        }
+      }
+
+      buffer = [];
+      resizeBuffer();
+      paused = false;
+      pauseButton.disabled = false;
+      pauseButton.textContent = 'STOP capture';
+      startButton.textContent = 'Apply';
+      status('Capturing.');
+      await beginSegment();
+    } catch (error) {
+      status('Capture failed: ' + error.message);
+    } finally {
+      startButton.disabled = false;
+    }
+  }
+
+  async function togglePause() {
+    if (!stream) return;
+
+    if (!paused) {
+      paused = true;
+      await stopCurrentSegment(true);
+      pauseButton.textContent = 'Start capture';
+      status('Capture paused. Select clips to export.');
+      render();
+    } else {
+      // Resume starts a new buffer/session for now, as requested.
+      buffer = [];
+      resizeBuffer();
+      paused = false;
+      pauseButton.textContent = 'STOP capture';
+      status('Capture resumed.');
+      await beginSegment();
+    }
+  }
+
+  async function downloadSelected() {
+  const selected = buffer.filter(clip => clip.blob && clip.selected);
+  if (!selected.length) return;
+
+  downloadButton.disabled = true;
+  status('Preparing clips…');
+
+  let output;
+
+  try {
+    const inputs = [];
+
+    // Read the selected WebM files.
+    for (const clip of selected) {
+      const input = new Input({
+        formats: ALL_FORMATS,
+        source: new BlobSource(clip.blob)
+      });
+
+      const video = await input.getPrimaryVideoTrack();
+      const audio = await input.getPrimaryAudioTrack();
+
+      if (!video) throw new Error('Clip has no video track.');
+
+      inputs.push({ input, video, audio });
+    }
+
+    // Get codec configuration from the first clip.
+    const videoConfig = await inputs[0].video.getDecoderConfig();
+    const audioConfig = inputs[0].audio
+      ? await inputs[0].audio.getDecoderConfig()
+      : null;
+
+    if (!videoConfig) throw new Error('Cannot read video configuration.');
+
+    const videoCodec = videoConfig.codec.startsWith('vp09')
+      ? 'vp9'
+      : videoConfig.codec.startsWith('vp8')
+        ? 'vp8'
+        : null;
+
+    if (!videoCodec) {
+      throw new Error('Unsupported video codec: ' + videoConfig.codec);
+    }
+
+    if (audioConfig && !audioConfig.codec.startsWith('opus')) {
+      throw new Error('Unsupported audio codec: ' + audioConfig.codec);
+    }
+
+    // Create output tracks that accept already-encoded packets.
+    const target = new BufferTarget();
+
+    output = new Output({
+      format: new WebMOutputFormat(),
+      target
+    });
+
+    const videoSource = new EncodedVideoPacketSource(videoCodec);
+    output.addVideoTrack(videoSource);
+
+    const audioSource = audioConfig
+      ? new EncodedAudioPacketSource('opus')
+      : null;
+
+    if (audioSource) output.addAudioTrack(audioSource);
+
+    await output.start();
+
+    let offset = 0;
+    let firstVideo = true;
+    let firstAudio = true;
+
+    for (const clip of inputs) {
+      // Verify that every segment has compatible codec settings.
+      const vc = await clip.video.getDecoderConfig();
+      if (vc.codec !== videoConfig.codec ||
+          vc.codedWidth !== videoConfig.codedWidth ||
+          vc.codedHeight !== videoConfig.codedHeight) {
+        throw new Error('Video configuration differs between clips.');
+      }
+
+      const videoSink = new EncodedPacketSink(clip.video);
+      let videoBase = null;
+      let videoEnd = 0;
+
+      for await (const packet of videoSink.packets()) {
+        if (videoBase === null) videoBase = packet.timestamp;
+
+        const timestamp = packet.timestamp - videoBase + offset;
+
+        await videoSource.add(
+          packet.clone({ timestamp }),
+          firstVideo ? { decoderConfig: videoConfig } : undefined
+        );
+
+        firstVideo = false;
+        videoEnd = Math.max(
+          videoEnd,
+          timestamp + packet.duration
+        );
+      }
+
+      let audioEnd = 0;
+
+      if (audioSource && clip.audio) {
+        const ac = await clip.audio.getDecoderConfig();
+
+        if (!ac || ac.codec !== audioConfig.codec) {
+          throw new Error('Audio configuration differs between clips.');
+        }
+
+        const audioSink = new EncodedPacketSink(clip.audio);
+        let audioBase = null;
+
+        for await (const packet of audioSink.packets()) {
+          if (audioBase === null) audioBase = packet.timestamp;
+
+          const timestamp = packet.timestamp - audioBase + offset;
+
+          await audioSource.add(
+            packet.clone({ timestamp }),
+            firstAudio ? { decoderConfig: audioConfig } : undefined
+          );
+
+          firstAudio = false;
+          audioEnd = Math.max(
+            audioEnd,
+            timestamp + packet.duration
+          );
+        }
+      }
+
+      // Advance to the end of this segment.
+      offset = Math.max(videoEnd, audioEnd);
+
+      status('Remuxed ' + (inputs.indexOf(clip) + 1) +
+        ' / ' + inputs.length + ' clips…');
+    }
+
+    await output.finalize();
+
+    const result = new Blob([target.buffer], {
+      type: 'video/webm'
+    });
+
+    const url = URL.createObjectURL(result);
+    const a = document.createElement('a');
+
+    a.href = url;
+    a.download = 'window-clips-' +
+      new Date().toISOString().replaceAll(':', '-') + '.webm';
+
+    a.click();
+
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+
+    status('Export complete.');
+  } catch (error) {
+    if (output && output.state !== 'finalized') {
+      await output.cancel().catch(() => {});
+    }
+
+    status('Export failed: ' + error.message);
+  } finally {
+    updateDownload();
+  }
+}
+
+startButton.addEventListener('click', startCapture);
+pauseButton.addEventListener('click', togglePause);
+downloadButton.addEventListener('click', downloadSelected);
+
+
+if (!navigator.mediaDevices?.getDisplayMedia || !window.MediaRecorder) {
+  status('Required capture APIs are unavailable.');
+} else {
+  startButton.classList.add('visible');
+}
+})();
+</script>
